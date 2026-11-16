@@ -1,17 +1,14 @@
 from fastapi import FastAPI, Request, Header, HTTPException, BackgroundTasks, UploadFile, File, Form, APIRouter
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, FileResponse, Response, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse, FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 import os
 import json
-from urllib.parse import quote
 import copy
 import logging
 import hashlib
-import uuid
 from typing import Optional, List, Dict, Any, Union
 from pathlib import Path
-from types import SimpleNamespace
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
@@ -36,6 +33,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import Image as PdfImage, ListFlowable, ListItem, Paragraph, SimpleDocTemplate, Spacer
 from youtube_transcript_api import YouTubeTranscriptApi
 import re
+import math
 import time
 import html
 from collections import Counter
@@ -55,7 +53,7 @@ from project_paths import STATIC_DIR, VIDEO_DIR, TRANSCRIPTS_DIR, SCENES_DIR, TH
 from processors.video_processor import VideoProcessor
 from processors.scene_processor import SceneProcessor
 from processors.ocr_processor import OCRProcessor
-from processors.transcript_processor import TranscriptProcessor, get_huggingface_token
+from processors.transcript_processor import TranscriptProcessor, get_huggingface_token, SPEAKER_MODES
 from cloud_transcribe import cloud_provider_status, recommended_transcription_model
 from transcribe import get_whisper_device_config
 from processors.embedding_processor import EmbeddingProcessor
@@ -63,26 +61,17 @@ from processors.summary_processor import SummaryProcessor
 from processors import transcript_versions
 from content_edits import router as content_edits_router
 from chapter_projects import router as chapter_projects_router, save_video_metadata
+from library_search import router as library_search_router
 import content_edits
 from content_languages import localized_scenes, scene_title
 import video_summary
-from fusion import (
-    FusionValidationError,
-    MAX_DOCUMENT_BYTES,
-    LOCAL_MODEL_DEFAULT,
-    ensure_local_model_available,
-    run_local_fusion,
-)
-from resource_finder import ResourceFinderError, find_resources, get_page
-from tutor import TutorError, answer_question
-import mindmap
+from content_history import router as content_history_router, ContentHistoryMiddleware
 
 load_dotenv()
 
 # Initialize FastAPI app
 @asynccontextmanager
 async def lifespan(app):
-    instructor_lms.init_db()
     transcript_processor.restore_interrupted_speaker_jobs()
     yield
 
@@ -91,31 +80,11 @@ app = FastAPI(lifespan=lifespan)
 app.include_router(content_edits_router)
 app.include_router(chapter_projects_router)
 app.include_router(library.router)
-from instructor_lms import router as instructor_lms_router
-import instructor_lms
-app.include_router(instructor_lms_router)
+app.include_router(library_search_router)
+app.include_router(content_history_router)
+app.add_middleware(ContentHistoryMiddleware)
 
 ensure_app_directories()
-
-@app.middleware("http")
-async def protect_lms_video_resources(request: Request, call_next):
-    """Apply LMS enrollment checks to existing media and analysis URLs."""
-    parts = request.url.path.strip("/").split("/")
-    job_stores = {
-        "export_jobs": globals().get("export_jobs"),
-        "chapter_project_jobs": chapter_projects.jobs,
-        "chapter_video_jobs": chapter_projects.video_jobs,
-    }
-    if len(parts) >= 2 and parts[0] in job_stores and job_stores[parts[0]]:
-        try:
-            job = job_stores[parts[0]].read(parts[1])
-        except (ValueError, FileNotFoundError):
-            job = None
-        if job and job.get("video_id") and not instructor_lms.legacy_video_access_allowed(
-            request, job["video_id"],
-        ):
-            return JSONResponse({"detail": "This lecture is not available to your account."}, status_code=403)
-    return await instructor_lms.protect_lms_video_resources(request, call_next)
 
 @app.middleware("http")
 async def disable_frontend_cache(request: Request, call_next):
@@ -162,6 +131,7 @@ async def runtime_status():
         "openai_configured": bool(summary_processor.openai_client),
         "groq_configured": bool(summary_processor.groq_client),
         "huggingface_token_configured": bool(get_huggingface_token()),
+        "speaker_modes": list(SPEAKER_MODES),
         "transcription_providers": cloud_provider_status(),
     }
     try:
@@ -197,192 +167,6 @@ async def runtime_status():
             **translation_status,
         })
 
-
-@app.get("/fusion_runtime_status")
-async def fusion_runtime_status():
-    """Return the fusion runtime configuration and readiness (local Ollama, optional Groq fallback)."""
-    cloud_available = bool(os.getenv("GROQ_API_KEY"))
-    try:
-        status = ensure_local_model_available(LOCAL_MODEL_DEFAULT, require_running=True)
-        return JSONResponse({
-            "runtime": status["runtime"],
-            "model": status["model"],
-            "ready": True,
-            "note": "Local inference is used first. Cloud fallback only runs if you opt in and the local model is unavailable.",
-            "cloud_fallback_allowed": cloud_available,
-        })
-    except Exception as error:
-        return JSONResponse({
-            "runtime": "Ollama",
-            "model": LOCAL_MODEL_DEFAULT,
-            "ready": False,
-            "error": str(error),
-            "note": "Install Ollama and pull the local model, or enable cloud fallback (needs GROQ_API_KEY).",
-            "cloud_fallback_allowed": cloud_available,
-        }, status_code=503)
-
-
-@app.post("/fusion_jobs")
-async def start_fusion_job(
-    files: list[UploadFile] = File(default=[]),
-    video_sources: str = Form(""),
-    model: str = Form(LOCAL_MODEL_DEFAULT),
-    allow_cloud_fallback: bool = Form(False),
-):
-    """Create a fusion export; Groq is used only when the user opts in and Ollama is unavailable."""
-    try:
-        videos = [item.strip() for item in str(video_sources).split(",") if item.strip()]
-        # UploadFile.read is async, so read the bytes here and hand plain objects to the sync fusion code.
-        uploads = []
-        for file in files:
-            if file.filename:
-                content = await file.read()
-                uploads.append(SimpleNamespace(filename=file.filename, read=lambda data=content: data))
-        job_id = uuid.uuid4().hex
-        output_dir = EXPORTS_DIR / "fusion" / job_id
-        output_dir.mkdir(parents=True, exist_ok=True)
-        result = await asyncio.to_thread(
-            run_local_fusion, video_sources=videos, uploaded_files=uploads, model_name=model, output_dir=output_dir,
-            allow_cloud_fallback=allow_cloud_fallback,
-        )
-        return JSONResponse({
-            "job_id": job_id,
-            "status": "complete",
-            "title": result["title"],
-            "pptx_url": f"/fusion_jobs/{job_id}/download/pptx",
-            "pdf_url": f"/fusion_jobs/{job_id}/download/pdf",
-            "relationships": result["relationships"],
-            "source_count": len(result["sources"]),
-            "local_model": result["local_model"],
-            "used_cloud_fallback": result.get("used_cloud_fallback", False),
-        })
-    except FusionValidationError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-    except RuntimeError as error:
-        raise HTTPException(status_code=503, detail=str(error)) from error
-    finally:
-        for file in files:
-            await file.close()
-
-
-@app.get("/fusion_jobs/{job_id}/download/{kind}")
-async def download_fusion_artifact(job_id: str, kind: str):
-    if not re.fullmatch(r"[0-9a-f]{32}", job_id) or kind not in {"pptx", "pdf"}:
-        raise HTTPException(status_code=404, detail="Fusion export not found.")
-    matches = sorted((EXPORTS_DIR / "fusion" / job_id).glob(f"*.{kind}"))
-    if not matches:
-        raise HTTPException(status_code=404, detail="Fusion export not found.")
-    return FileResponse(matches[0], filename=f"lecture_fusion.{kind}")
-
-
-@app.post("/resource_finder/search")
-async def search_learning_resources(
-    topic: str = Form(""),
-    file: Optional[UploadFile] = File(default=None),
-    types: List[str] = Form(default=[]),
-    use_llm: bool = Form(True),
-    allow_cloud_fallback: bool = Form(False),
-):
-    try:
-        filename = file.filename if file and file.filename else ""
-        data = await file.read(MAX_DOCUMENT_BYTES + 1) if file else None
-        record = await asyncio.to_thread(
-            find_resources,
-            topic=topic,
-            filename=filename,
-            data=data,
-            types=types,
-            use_llm=use_llm,
-            allow_cloud_fallback=allow_cloud_fallback,
-        )
-        return JSONResponse(get_page(record["search_id"]))
-    except ResourceFinderError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-    finally:
-        if file:
-            await file.close()
-
-
-@app.get("/resource_finder/{search_id}")
-async def get_learning_resources(
-    search_id: str,
-    offset: int = 0,
-    resource_type: str = "",
-    platform: str = "",
-    difficulty: str = "",
-    language: str = "",
-):
-    filters = {
-        key: value for key, value in {
-            "type": resource_type,
-            "platform": platform,
-            "difficulty": difficulty,
-            "language": language,
-        }.items() if value
-    }
-    try:
-        return JSONResponse(get_page(search_id, filters=filters, offset=offset))
-    except ResourceFinderError as error:
-        raise HTTPException(status_code=404, detail=str(error)) from error
-
-
-@app.post("/ai_tutor")
-async def ai_tutor(request: Request):
-    """Provide a lecture-grounded AI tutor response that keeps lecture evidence separate from external context."""
-    try:
-        payload = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="JSON body required for AI tutor requests.")
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail="AI tutor payload must be an object.")
-    video_id = str(payload.get("video_id") or "")
-    question = str(payload.get("question") or "").strip()
-    session_id = str(payload.get("session_id") or "default")
-    allow_fallback = bool(payload.get("allow_cloud_fallback", False))
-    try:
-        result = answer_question(
-            video_id,
-            question,
-            session_id=session_id,
-            allow_cloud_fallback=allow_fallback,
-        )
-    except TutorError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-    return JSONResponse(result)
-
-
-@app.get("/mindmap/{video_id}")
-async def get_mindmap(video_id: str):
-    try:
-        cached = mindmap.load_cached(video_id)
-    except TutorError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-    if not cached:
-        raise HTTPException(status_code=404, detail="No concept map has been generated for this lecture yet.")
-    return JSONResponse(cached)
-
-
-@app.post("/mindmap/{video_id}/generate")
-async def generate_mindmap(video_id: str, request: Request):
-    """Build a transcript-grounded concept map; cloud models are used only with explicit consent."""
-    try:
-        options = await request.json()
-    except Exception:
-        options = {}
-    if not isinstance(options, dict):
-        options = {}
-    try:
-        result = await asyncio.to_thread(
-            mindmap.generate_mindmap,
-            video_id,
-            use_llm=bool(options.get("use_llm", True)),
-            allow_cloud_fallback=bool(options.get("allow_cloud_fallback", False)),
-        )
-    except TutorError as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
-    return JSONResponse(result)
-
-
 # Mount static directory
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 templates = Jinja2Templates(directory=str(Path(__file__).resolve().parent / "templates"))
@@ -393,6 +177,7 @@ scene_processor = SceneProcessor()
 transcript_processor = TranscriptProcessor()
 embedding_processor = EmbeddingProcessor()
 summary_processor = SummaryProcessor()
+app.state.summary_processor = summary_processor
 
 def parse_uploaded_transcript(text, suffix):
     if suffix == ".json":
@@ -677,41 +462,13 @@ ocr_processor = OCRProcessor(send_sse_update=send_sse_update)
 
 @app.get("/", response_class=HTMLResponse)
 async def root(request: Request):
-    path = Path(__file__).resolve().parent / "templates" / "home.html"
-    return HTMLResponse(path.read_text(encoding="utf-8"), headers={
-        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
-        "Pragma": "no-cache",
-    })
-
-
-def _authenticated_page(request: Request, template_name: str):
-    """Render a signed-in page; visitors without a session are sent to the sign-in dialog and back."""
-    try:
-        instructor_lms.current_user(request)
-    except HTTPException as error:
-        if error.status_code == 401:
-            return RedirectResponse(f"/?login=1&next={quote(request.url.path)}", status_code=303)
-        raise
-    response = templates.TemplateResponse(request=request, name=template_name)
+    response = templates.TemplateResponse(
+    request=request,
+    name="index.html"
+    )
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
     return response
-
-
-@app.get("/workspace", response_class=HTMLResponse)
-async def lecture_workspace(request: Request):
-    return _authenticated_page(request, "index.html")
-
-
-@app.get("/fusion", response_class=HTMLResponse)
-async def fusion_workspace(request: Request):
-    return _authenticated_page(request, "fusion.html")
-
-
-@app.get("/resource-finder", response_class=HTMLResponse)
-async def resource_finder_workspace(request: Request):
-    return _authenticated_page(request, "resource_finder.html")
-
 
 @app.post("/upload_video")
 async def upload_video(background_tasks: BackgroundTasks, video: UploadFile = File(...)):
@@ -756,13 +513,24 @@ async def upload_video(background_tasks: BackgroundTasks, video: UploadFile = Fi
             temporary_path.unlink()
 
 @app.get("/uploaded_videos")
-async def uploaded_videos(request: Request):
+async def uploaded_videos():
     metadata_path = VIDEO_DIR / "metadata.json"
     try:
         metadata = json.loads(metadata_path.read_text(encoding="utf-8")) if metadata_path.exists() else {}
     except (OSError, json.JSONDecodeError):
         metadata = {}
     videos = []
+    variations = {}
+    for job in export_jobs.list():
+        if (job["status"] == "complete" and job["title"].startswith("Captioned video - ")
+                and job.get("filename", "").lower().endswith(".mp4")):
+            try:
+                export_jobs.file(job["id"], job["download_file"])
+            except FileNotFoundError:
+                continue
+            variations.setdefault(job["video_id"], []).append({
+                "id": job["id"], "filename": job["filename"],
+            })
     for video_path in sorted(VIDEO_DIR.glob("*"), key=lambda path: path.stat().st_mtime, reverse=True):
         if (
             not video_path.is_file()
@@ -771,13 +539,12 @@ async def uploaded_videos(request: Request):
             or video_path.suffix == ".pending"
         ):
             continue
-        if not instructor_lms.legacy_video_access_allowed(request, video_path.stem):
-            continue
         videos.append({
             "video_id": video_path.stem,
             "filename": metadata.get(video_path.stem, {}).get("filename", video_path.name),
             "size_bytes": video_path.stat().st_size,
-            "modified_at": video_path.stat().st_mtime
+            "modified_at": video_path.stat().st_mtime,
+            "caption_variations": variations.get(video_path.stem, []),
         })
     return {"success": True, "videos": videos}
 
@@ -802,6 +569,14 @@ async def stream_video(video_id: str, range: Optional[str] = Header(None)):
 async def get_scenes(video_id: str):
     return await scene_processor.get_scenes(video_id)
 
+@app.get("/scene_history/{video_id}")
+async def scene_history(video_id: str):
+    from processors.scene_history import list_sets
+    try:
+        return {"sets": await asyncio.to_thread(list_sets, video_id)}
+    except (OSError, ValueError, TypeError) as error:
+        raise HTTPException(400, f"Could not load slide history: {error}") from error
+
 @app.post("/detect_scenes/{video_id}")
 async def detect_scenes(video_id: str, request: Request, background_tasks: BackgroundTasks):
     video_path = video_processor.get_video_path(video_id)
@@ -820,6 +595,7 @@ async def detect_scenes(video_id: str, request: Request, background_tasks: Backg
             ),
             "maximum_slides_per_hour": int(data.get("maximum_slides_per_hour", 60)),
             "merge_similar_slides": bool(data.get("merge_similar_slides", True)),
+            "preserve_slide_replacements": data.get("preserve_slide_replacements", True),
             "include_chapter_boundaries": bool(data.get("include_chapter_boundaries", True)),
             "screenshot_height": int(data.get("screenshot_height", 720)),
         }
@@ -827,12 +603,14 @@ async def detect_scenes(video_id: str, request: Request, background_tasks: Backg
         raise HTTPException(status_code=400, detail="Invalid scene detection options")
     if mode not in {"adaptive", "content", "chapters"}:
         raise HTTPException(status_code=400, detail="Invalid scene detection mode")
+    if type(options["preserve_slide_replacements"]) is not bool:
+        raise HTTPException(status_code=400, detail="Preserve slide replacements must be true or false")
     if options["adaptive_detail"] not in {"fewer", "balanced", "more"}:
         raise HTTPException(status_code=400, detail="Invalid adaptive detail level")
     if not 10 <= options["content_threshold"] <= 60:
         raise HTTPException(status_code=400, detail="Content-cut threshold must be between 10 and 60")
     if options["minimum_slide_duration_percent"] is not None:
-        if options["minimum_slide_duration_percent"] not in {0.25, 0.5, 1, 2}:
+        if options["minimum_slide_duration_percent"] not in {0, 0.25, 0.5, 1, 2}:
             raise HTTPException(status_code=400, detail="Invalid minimum slide duration percentage")
     elif options["minimum_slide_duration"] not in {5, 10, 20, 30}:
         raise HTTPException(status_code=400, detail="Invalid minimum slide duration")
@@ -1061,6 +839,7 @@ async def generate_whisper_transcript(video_id: str, request: Request, backgroun
         str(options.get("model") or "") or None,
         str(options.get("prompt") or "").strip() or None,
         speakers_only=bool(options.get("speakers_only", False)),
+        speaker_mode=options.get("speaker_mode", "fast"),
     )
 
 @app.get("/whisper_transcript_status/{video_id}")
@@ -1387,24 +1166,89 @@ async def process_youtube(request: Request, background_tasks: BackgroundTasks):
             "error": str(e)
         })
 
+summary_generation_tasks = {}
+
+
+@app.post("/cancel_summary/{video_id}")
+async def cancel_summary(video_id: str):
+    task = summary_generation_tasks.get(video_id)
+    if task is None or task.done():
+        return {"success": False, "error": "No active chapter generation for this video."}
+    task.cancel()
+    return {"success": True}
+
+
 @app.post("/generate_summary")
 async def generate_summary(request: Request):
+    task = None
+    video_id = None
     try:
         data = await request.json()
         transcript = data.get("transcript", [])
         video_id = data.get("video_id")
+        if not isinstance(video_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", video_id):
+            raise ValueError("Invalid video ID.")
+        if video_id in summary_generation_tasks:
+            raise ValueError("Chapter generation is already running for this video.")
+        task = asyncio.current_task()
+        summary_generation_tasks[video_id] = task
+        basis = data.get("basis", "topics")
+        consider_slides = data.get("consider_slides", False)
+        slide_boundary_scope = data.get("slide_boundary_scope", "none")
+        if slide_boundary_scope not in ("none", "chapters", "sections", "both"):
+            raise ValueError("Invalid slide boundary scope.")
+        if basis == "speakers" and slide_boundary_scope != "none":
+            raise ValueError("Speaker-only chapters use exact speaker turns, not slide boundaries.")
+        if basis == "timestamps" and slide_boundary_scope in ("chapters", "both"):
+            raise ValueError("Exact chapter timestamps cannot use slide chapter boundaries. Select section boundaries only.")
+        if data.get("structure", "sections") == "flat" and slide_boundary_scope in ("sections", "both"):
+            raise ValueError("Choose chapters with sections to use slide section boundaries.")
+        if type(consider_slides) is not bool:
+            raise ValueError("Consider slides must be true or false.")
+        slide_starts = None
+        timestamp_options = {}
+        if basis == "timestamps":
+            source = chapter_projects._media_source(video_id, {})
+            timestamp_options = {"cut_points": data.get("cut_points"),
+                                 "video_duration_seconds": await video_duration(source)}
+        if (consider_slides and basis == "topics") or slide_boundary_scope != "none":
+            if not isinstance(video_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", video_id):
+                raise ValueError("Invalid video ID.")
+            scenes_path = SCENES_DIR / f"{video_id}.json"
+            if not scenes_path.is_file():
+                raise ValueError("Detect slides first, or turn off Consider detected slide changes in Chapter options.")
+            scenes = json.loads(scenes_path.read_text(encoding="utf-8"))
+            slide_starts = sorted({float(scene["time_seconds"]) for scene in scenes})
+            if not slide_starts or any(not math.isfinite(start) or start < 0 for start in slide_starts):
+                raise ValueError("No valid detected slides are available. Detect slides again or turn off slide-aware generation.")
+        boundary_slides = slide_starts if slide_boundary_scope != "none" else None
+        if not consider_slides or basis != "topics":
+            slide_starts = None
         return await summary_processor.generate_summary(
             transcript, video_id, data.get("model"), data.get("language", "transcript"),
             structure=data.get("structure", "sections"), detail=data.get("detail", "balanced"),
             instructions=str(data.get("instructions") or ""),
             transcript_language=data.get("transcript_language", ""),
             passes=data.get("passes", "one"),
+            slide_starts=slide_starts,
+            basis=basis,
+            boundary_slide_starts=boundary_slides,
+            slide_boundary_scope=slide_boundary_scope,
+            flag_transcript_gaps=data.get("flag_transcript_gaps", False),
+            transcript_gap_seconds=data.get("transcript_gap_seconds", 10),
+            **timestamp_options,
         )
+    except asyncio.CancelledError:
+        return JSONResponse({"success": False, "cancelled": True,
+                             "error": "Chapter generation stopped. Existing chapters were preserved."})
     except Exception as e:
         return JSONResponse({
             "success": False,
             "error": str(e)
         })
+    finally:
+        if task is not None and summary_generation_tasks.get(video_id) is task:
+            summary_generation_tasks.pop(video_id, None)
 
 
 @app.post("/video_summary/{video_id}/load")
@@ -1435,7 +1279,7 @@ async def chapter_tools(video_id: str, request: Request):
     data = await request.json()
     kind = data.get("kind")
     operation = data.get("operation")
-    if kind not in ("chapters", "slides") or operation not in ("enhance", "translate"):
+    if kind not in ("chapters", "slides") or operation not in ("enhance", "translate", "review"):
         raise HTTPException(400, "Invalid content action.")
     language = data.get("language", "")
     selected_language = data.get("transcript_language", "")
@@ -1446,7 +1290,7 @@ async def chapter_tools(video_id: str, request: Request):
             video_id, kind, language, source, version_id, selected_language,
         )
         revision = content_edits._revision(original)
-        target = language if operation == "enhance" else data.get("target_language")
+        target = language if operation in ("enhance", "review") else data.get("target_language")
         if target == "transcript":
             transcript = context[1] if context else content_edits._snapshot(
                 video_id, "transcript", selected_language, source, version_id, selected_language,
@@ -1459,7 +1303,7 @@ async def chapter_tools(video_id: str, request: Request):
     if not original:
         raise HTTPException(400, "Load saved content before using this action.")
     try:
-        if operation == "enhance":
+        if operation in ("enhance", "review"):
             if kind != "chapters":
                 raise HTTPException(400, "Enhancement applies to chapters and sections.")
             summary_processor._refresh_clients()
@@ -1467,11 +1311,16 @@ async def chapter_tools(video_id: str, request: Request):
             if not chain:
                 raise HTTPException(400, summary_processor._no_provider_message())
             provider, model = chain[0]
-            content = await summary_processor.enhance_chapters(
-                original, provider, model,
-                summary_processor._chapter_settings("sections", data.get("detail", "balanced"), data.get("instructions", "")),
-                summary_processor._summary_language_instruction(language or selected_language or "transcript"),
-            )
+            if operation == "review":
+                content = await summary_processor.review_disruptions(original, context[1], provider, model)
+            else:
+                content = await summary_processor.enhance_chapters(
+                    original, provider, model,
+                    summary_processor._chapter_settings("sections", data.get("detail", "balanced"), data.get("instructions", "")),
+                    summary_processor._summary_language_instruction(language or selected_language or "transcript"),
+                )
+                content = await summary_processor._verify_chapter_boundaries(content, context[1], provider, model)
+                content = await summary_processor._verify_section_boundaries(content, context[1], provider, model)
             content = [{**chapter, "user_edited": True} for chapter in content]
         else:
             content = copy.deepcopy(original)
@@ -2609,16 +2458,26 @@ async def export_job_status(job_id: str):
     return read_export_job(job_id)
 
 
+@app.post("/export_jobs/{job_id}/cancel")
+async def cancel_caption_export(job_id: str):
+    state = read_export_job(job_id)
+    if not state["title"].startswith("Captioned video - "):
+        raise HTTPException(status_code=400, detail="Only captioned-video exports can be stopped here")
+    try:
+        return export_jobs.cancel(job_id)
+    except ValueError as error:
+        raise HTTPException(status_code=409, detail=str(error)) from error
+
+
 @app.get("/saved_exports/{video_id}")
 async def saved_exports(video_id: str):
     return {"exports": export_jobs.list(video_id)}
 
 @app.get("/saved_caption_videos")
-async def saved_caption_videos(request: Request):
+async def saved_caption_videos():
     return {"exports": [
         job for job in export_jobs.list()
         if job["title"].startswith("Captioned video - ")
-        and instructor_lms.legacy_video_access_allowed(request, job["video_id"])
     ]}
 
 
@@ -2887,6 +2746,7 @@ async def export_chapters(video_id: str, request: Request, on_step=None, on_arti
             chaptered_lines = [f"# {document_title}", ""]
             chapter_files = []
             image_cache = {}
+            section_image_cache = {}
             overlap_seconds = 1.0 if options.get("clip_overlap", True) else 0.0
             include_slide_text = bool(options.get("include_slide_text", False))
             if include_slide_text and not any(scene.get("slide_text") for scene in scene_chapters):
@@ -3007,12 +2867,18 @@ async def export_chapters(video_id: str, request: Request, on_step=None, on_arti
                         chapter, chapter_transcript, files["outline_points"], scene_chapters, subpart_mode,
                         ai_extras.get("section_titles"),
                     )
-                    for subpart in files["subparts"]:
+                    for subpart_index, subpart in enumerate(files["subparts"], start=1):
                         subpart["transcript"] = "\n".join(
                             format_export_transcript_item(item) if timestamp_mode == "original"
                             else re.sub(r"^\[[^\]]+\]\s*", "", format_export_transcript_item(item))
                             for item in subpart["sentences"]
                         )
+                        if not subpart["slides"] and (export_flags["include_webpage"] or export_flags["include_scorm"]):
+                            subpart["image"] = temp_dir / f"section_{number:02d}_{subpart_index:02d}.jpg"
+                            prepare_export_image(
+                                video_id, video_path, subpart["start"], [],
+                                subpart["image"], section_image_cache, step,
+                            )
                         for scene in subpart["slides"]:
                             slide_start = export_slide_start(scene)
                             scene["image"] = temp_dir / f"slide_{int(slide_start * 1000):010d}.jpg"
@@ -3138,8 +3004,8 @@ async def export_chapters(video_id: str, request: Request, on_step=None, on_arti
                     "img,video{max-width:100%;display:block}video{width:100%;border-radius:10px;background:#000;margin:1rem 0}"
                     ".chapter-summary{font-size:1.05rem;margin:.75rem 0}"
                     "figure{margin:0}.chapter-heading,.subpart-heading{display:flex;align-items:center;gap:1rem;flex-wrap:wrap}"
-                    ".export-thumbnail{margin:.5rem 0;width:120px;flex-shrink:0}"
-                    ".export-thumbnail img{width:120px;height:68px;object-fit:contain;margin:0;cursor:zoom-in;border-radius:6px;border:1px solid var(--line)}"
+                    ".export-thumbnail{margin:.5rem 0;width:160px;max-width:100%;flex-shrink:0}"
+                    ".export-thumbnail img{width:160px;height:90px;object-fit:contain;margin:0;cursor:zoom-in;border-radius:6px;border:1px solid var(--line)}"
                     ".export-thumbnail figcaption{font-size:.78rem;color:var(--muted);overflow-wrap:anywhere;margin:.25rem 0}"
                     ".chapter-subparts{margin-block:1rem 0;margin-inline:1.5rem 0;padding-inline-start:1rem;border-inline-start:3px solid var(--line)}"
                     ".chapter-subparts>summary{font-weight:600;cursor:pointer;color:var(--brand)}"
@@ -3248,7 +3114,7 @@ async def export_chapters(video_id: str, request: Request, on_step=None, on_arti
                                 f"{scene['image_index'] + 1}: ",
                             ))
                         if not subpart["slides"]:
-                            webpage_parts.append(export_thumbnail(image_name, subpart["title"]))
+                            webpage_parts.append(export_thumbnail(subpart["image"].name, subpart["title"]))
                         webpage_parts.append("</div><p>")
                         webpage_parts.append(seek_link(
                             chapter["index"], chapter["clip_start"], subpart["start"],

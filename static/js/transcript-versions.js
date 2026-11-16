@@ -55,7 +55,8 @@ function render() {
     if (!selected) {
         const placeholder = document.createElement('option');
         placeholder.value = '';
-        placeholder.textContent = state.currentTranscriptSource === 'youtube'
+        placeholder.textContent = state.currentVideoId && state.currentTranscript?.length
+            && state.currentTranscriptSource === 'youtube'
             ? 'YouTube captions (current)' : 'Saved transcripts…';
         element.append(placeholder);
     }
@@ -157,7 +158,7 @@ export async function chooseTranscriptVersion(versionId) {
         if (!response.ok) throw new Error(data.detail || `HTTP ${response.status}`);
         if (videoId !== state.currentVideoId) return;
         const version = data.version;
-        state.whisperTranscriptPollGeneration = (state.whisperTranscriptPollGeneration || 0) + 1;
+        document.dispatchEvent(new CustomEvent('transcriptVersionSelected'));
         state.currentTranscriptVersionId = version.id;
         const targetSelect = document.getElementById('translationTarget');
         if (version.kind === 'translation') {
@@ -226,5 +227,10 @@ export function initTranscriptVersions() {
     document.addEventListener('transcriptUpdated', () => {
         if (!switching) state.currentTranscriptVersionId = null;
         scheduleRefresh();
+    });
+    document.addEventListener('videoSelectionChanged', () => {
+        ++refreshGeneration;
+        versions = [];
+        render();
     });
 }
